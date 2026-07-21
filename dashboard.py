@@ -1,4 +1,3 @@
-from pandas import col
 import streamlit as st
 import yfinance as yf
 import requests
