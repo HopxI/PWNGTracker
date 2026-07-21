@@ -8,3 +8,6 @@ beautifulsoup4
 tensorflow-cpu
 transformers
 torch
+finnhub-python
+ccxt
+alpaca-py
