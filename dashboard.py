@@ -4,6 +4,7 @@ import requests
 import time
 import datetime
 import pandas as pd
+import torch
 from bs4 import BeautifulSoup
 from transformers import pipeline
 import numpy as np
