@@ -713,5 +713,3 @@ if run_analysis or "has_run" in st.session_state or auto_refresh:
 
 else:
     st.info("👈 Set your parameters in the sidebar and click **🚀 Run Analysis** to start the live terminal!")
-else:
-    st.info("👈 Set your parameters in the sidebar and click **🚀 Run Analysis** to start the live terminal!")
