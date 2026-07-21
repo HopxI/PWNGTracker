@@ -4,6 +4,7 @@ pandas
 numpy
 requests
 scikit-learn
-tensorflow
-transformers
 beautifulsoup4
+tensorflow-cpu
+transformers
+torch
