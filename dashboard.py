@@ -10,6 +10,98 @@ from bs4 import BeautifulSoup
 from transformers import pipeline
 from sklearn.svm import SVR
 from sklearn.preprocessing import MinMaxScaler
+import finnhub
+import ccxt
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+
+finnhub_key = None
+
+def execute_alpaca_order(api_key, secret_key, ticker, qty, side, order_type="market", limit_price=None):
+    """Executes a live or paper trade via Alpaca API."""
+    try:
+        trading_client = TradingClient(api_key, secret_key, paper=True)
+        
+        # Format ticker symbol for Alpaca Crypto trading
+        alpaca_symbol = ticker.replace("-", "/")
+        if "/" not in alpaca_symbol and ticker in ["BTC", "ETH", "SOL"]:
+            alpaca_symbol = f"{ticker}/USD"
+
+        order_side = OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL
+        
+        if order_type == "market":
+            order_data = MarketOrderRequest(
+                symbol=alpaca_symbol,
+                qty=qty,
+                side=order_side,
+                time_in_force=TimeInForce.GTC  # Crypto uses Good-Til-Cancelled (GTC)
+            )
+        elif order_type == "limit":
+            order_data = LimitOrderRequest(
+                symbol=alpaca_symbol,
+                qty=qty,
+                side=order_side,
+                time_in_force=TimeInForce.GTC,
+                limit_price=limit_price
+            )
+            
+        order = trading_client.submit_order(request_data=order_data)
+        return True, f"Order Submitted Successfully! ID: {order.id}"
+    except Exception as e:
+        return False, str(e)
+    
+def fetch_aggregated_order_book(symbol="BTC/USDT"):
+    """Fetches top Bid and Ask liquidity across multiple exchanges."""
+    exchanges = {
+        "Binance": ccxt.binance(),
+        "Kraken": ccxt.kraken(),
+        "Coinbase": ccxt.coinbasepro()
+    }
+    
+    book_data = []
+    
+    for name, ex in exchanges.items():
+        try:
+            # Format symbol for standard CCXT mapping
+            clean_symbol = symbol.replace("-", "/")
+            if not clean_symbol.endswith("USDT") and not clean_symbol.endswith("USD"):
+                clean_symbol += "/USDT"
+                
+            orderbook = ex.fetch_order_book(clean_symbol, limit=5)
+            
+            top_bid = orderbook['bids'][0][0] if orderbook['bids'] else 0  # Highest Buy Order
+            top_ask = orderbook['asks'][0][0] if orderbook['asks'] else 0  # Lowest Sell Order
+            
+            book_data.append({
+                "Exchange": name,
+                "Best Buy (Bid)": f"${top_bid:,.2f}",
+                "Best Sell (Ask)": f"${top_ask:,.2f}",
+                "Spread": f"${abs(top_ask - top_bid):,.2f}"
+            })
+        except Exception:
+            book_data.append({"Exchange": name, "Best Buy (Bid)": "N/A", "Best Sell (Ask)": "N/A", "Spread": "N/A"})
+            
+    return pd.DataFrame(book_data)
+
+def get_finnhub_insights(ticker, api_key):
+    """Fetches real-time company news & Wall St price targets via Finnhub."""
+    if not api_key:
+        return None, None
+    try:
+        finnhub_client = finnhub.Client(api_key=api_key)
+        
+        # 1. Get recent company news
+        today = datetime.date.today().strftime('%Y-%m-%d')
+        week_ago = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+        news = finnhub_client.company_news(ticker, _from=week_ago, to=today)
+        
+        # 2. Get Wall Street Price Target consensus
+        targets = finnhub_client.price_target(ticker)
+        
+        return news[:5], targets
+    except Exception as e:
+        return None, None
 
 # --- ML FORECASTING MODULES ---
 def get_fundamentals_data(ticker, asset_type):
@@ -122,6 +214,23 @@ def predict_lstm(df_close, lookback=10):
 
     return pred_price
 
+if finnhub_key and asset_type == "Stock":
+    news, targets = get_finnhub_insights(ticker, finnhub_key)
+    
+    if targets and 'targetMean' in targets:
+        st.subheader("🎯 Wall Street Consensus Price Targets")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("High Target", f"${targets['targetHigh']}")
+        col2.metric("Mean Target", f"${targets['targetMean']}")
+        col3.metric("Low Target", f"${targets['targetLow']}")
+        
+    if news:
+        st.subheader("📰 Breaking Company Headlines")
+        for item in news:
+            with st.expander(f"• {item['headline']}"):
+                st.write(item['summary'])
+                st.markdown(f"[Read full article]({item['url']})")
+
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Institutional Trading Terminal", layout="wide")
 st.title("🏛️ Institutional Research Terminal: Live Market & Signals")
@@ -133,6 +242,8 @@ if "telegram_token" not in st.session_state:
 if "telegram_chat_id" not in st.session_state:
     st.session_state["telegram_chat_id"] = "8026092339" 
 
+if "finnhub_key" not in locals():
+    finnhub_key = None
 # --- CACHING THE AI MODEL ---
 @st.cache_resource
 def load_ai_model():
@@ -172,17 +283,22 @@ def calculate_rsi(series, period=14):
     return (100 - (100 / (1 + rs))).iloc[-1]
 
 def get_market_data_expanded(ticker, asset_type):
-    symbol = ticker if asset_type == "Stock" else f"{ticker}-USD"
+    # Automatically format crypto symbols (e.g., "BTC" -> "BTC-USD")
+    if asset_type == "Crypto":
+        symbol = ticker if ticker.endswith("-USD") else f"{ticker}-USD"
+    else:
+        symbol = ticker
+
     try:
         asset = yf.Ticker(symbol)
         hist = asset.history(period="1y")
-        if hist.empty or len(hist) < 30: return None
+        if hist.empty or len(hist) < 30: 
+            return None
         
         current_price = hist['Close'].iloc[-1]
         ema_5 = hist['Close'].ewm(span=5, adjust=False).mean().iloc[-1]
         sma_20 = hist['Close'].rolling(window=20).mean().iloc[-1]
         
-        # Support and Resistance for Setups
         support = hist['Low'].tail(20).min()
         resistance = hist['High'].tail(20).max()
         
@@ -219,11 +335,15 @@ def crawl_macro_environment():
 # --- CONTROL PANEL ---
 st.sidebar.header("⚙️ Command Center")
 asset_type = st.sidebar.radio("Asset Class:", ["Stock", "Crypto"])
-default_tickers = "AAPL, NVDA" if asset_type == "Stock" else "BTC, SOL"
-user_input = st.sidebar.text_input("Tickers (comma separated):", default_tickers)
+user_input = st.sidebar.text_input("Tickers (comma separated):", "AAPL, NVDA" if asset_type == "Stock" else "BTC, SOL")
 
-# ADD THIS LINE HERE (Outside the loop, with a unique key)
-etherscan_key = st.sidebar.text_input("Etherscan API Key (100% Free):", type="password", key="global_etherscan_key")
+# API Keys (ALL DEFINED ONCE HERE)
+finnhub_key = st.sidebar.text_input("Finnhub API Key (Free):", type="password", key="fh_key")
+etherscan_key = st.sidebar.text_input("Etherscan API Key:", type="password", key="global_etherscan_key")
+
+with st.sidebar.expander("🔑 Alpaca API Trading Credentials"):
+    alpaca_key = st.text_input("Alpaca Key:", type="password", key="alp_key")
+    alpaca_secret = st.text_input("Alpaca Secret:", type="password", key="alp_sec")
 
 # Live Refresh Toggle
 auto_refresh = st.sidebar.checkbox("🟢 Enable Live Auto-Refresh (60s)")
@@ -327,7 +447,35 @@ if run_analysis or "has_run" in st.session_state or auto_refresh:
             e1, e2 = st.columns(2)
             e1.metric("Hard Stop-Loss (SL)", f"${support * 0.98:,.2f}", delta="-2% Below Support", delta_color="inverse")
             e2.metric("Take-Profit (TP)", f"${resistance * 0.98:,.2f}", delta="Front-running Resistance")
+            # Add inside Tab 1 (Entry Points & Timings)
+            st.markdown("---")
+            st.subheader(f"⚡ Execute Trade for {ticker} (Alpaca Paper Trading)")
 
+            col_trade1, col_trade2, col_trade3 = st.columns(3)
+
+            with col_trade1:
+                trade_side = st.selectbox("Action", ["BUY", "SELL"], key=f"side_{ticker}")
+            with col_trade2:
+                trade_qty = st.number_input("Shares/Units Quantity", min_value=1, value=10, key=f"qty_{ticker}")
+            with col_trade3:
+                order_kind = st.selectbox("Order Type", ["market", "limit"], key=f"type_{ticker}")
+
+            limit_px = None
+            if order_kind == "limit":
+                limit_px = st.number_input("Limit Price Target ($)", value=float(current_price), key=f"px_{ticker}")
+
+            if st.button(f"🚀 Send {trade_side} Order for {ticker}", type="primary", key=f"btn_{ticker}"):
+                if not alpaca_key or not alpaca_secret:
+                    st.error("Please enter your Alpaca API Key and Secret Key in the sidebar expander first!")
+                else:
+                    with st.spinner("Transmitting order to Alpaca Execution Engine..."):
+                        success, msg = execute_alpaca_order(
+                            alpaca_key, alpaca_secret, ticker, trade_qty, trade_side, order_kind, limit_px
+                        )
+                        if success:
+                            st.success(msg)
+                        else:
+                            st.error(f"Execution Failed: {msg}")
         # TAB 2: TECHNICAL DATA
         with tab_tech:
             st.subheader("Volatility Breakdown")
@@ -556,11 +704,14 @@ if run_analysis or "has_run" in st.session_state or auto_refresh:
                         st.caption("Search filing history for UK-listed equities and subsidiaries.")
                 else:
                     st.error(f"Could not load fundamental financial statements for {ticker}.")
-                    
+
     if auto_refresh:
         st.caption("Live mode active. Refreshing in 60 seconds...")
         time.sleep(60)
         st.rerun()
 
+
+else:
+    st.info("👈 Set your parameters in the sidebar and click **🚀 Run Analysis** to start the live terminal!")
 else:
     st.info("👈 Set your parameters in the sidebar and click **🚀 Run Analysis** to start the live terminal!")
